@@ -84,11 +84,32 @@ def main
     puts "\n#{result[:source].name} -> #{result[:target].name}:"
     puts "  Status: #{result[:status]}"
     puts "  Last Sync: #{result[:last_sync_time]}"
-    puts "  Objects in Sync: #{result[:objects_in_sync]}/#{result[:total_objects]}"
+    puts "  Objects in Sync: #{result[:objects_in_sync]}/#{result[:total_objects]} (#{result[:sync_percentage]}%)"
+    
+    # Show detailed breakdown if available
+    if result[:missing_objects] || result[:content_mismatches] || result[:stale_objects] || result[:size_mismatches]
+      puts "  Breakdown:"
+      puts "    - Missing: #{result[:missing_objects] || 0}"
+      puts "    - Content mismatches: #{result[:content_mismatches] || 0}" 
+      puts "    - Stale objects: #{result[:stale_objects] || 0}"
+      puts "    - Size mismatches: #{result[:size_mismatches] || 0}"
+    end
     
     if result[:status] != 'healthy'
       puts "  Issues:"
       result[:issues].each { |issue| puts "    - #{issue}" }
+      
+      # Show detailed status for critical issues (optional)
+      if ENV['VERBOSE'] && result[:detailed_status]
+        problem_objects = result[:detailed_status].select { |detail| detail[:status] != 'replicated' }
+        if problem_objects.any?
+          puts "  Problem Objects:"
+          problem_objects.first(5).each do |obj|
+            puts "    - #{obj[:key]}: #{obj[:status]} (#{obj[:issue]})"
+          end
+          puts "    ... and #{problem_objects.length - 5} more" if problem_objects.length > 5
+        end
+      end
     end
   end
 

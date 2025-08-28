@@ -28,16 +28,16 @@ class ReplicationMonitor
     begin
       source_status = source_region.get_replication_status(target_region)
       
-      # Calculate metrics
+      # Extract metrics from enhanced status
       total_objects = source_status[:total_objects]
       replicated_objects = source_status[:replicated_objects]
-      sync_percentage = total_objects > 0 ? (replicated_objects.to_f / total_objects * 100).round(2) : 100.0
+      sync_percentage = source_status[:sync_percentage]
       
-      # Determine overall status
-      status = determine_replication_status(sync_percentage, source_region, target_region)
+      # Determine overall status based on enhanced health assessment
+      status = source_status[:replication_health] || determine_replication_status(sync_percentage, source_region, target_region)
       
-      # Collect any issues
-      issues = collect_replication_issues(source_status, target_region, sync_percentage)
+      # Collect comprehensive issues
+      issues = collect_enhanced_replication_issues(source_status)
       
       {
         source: source_region,
@@ -46,8 +46,13 @@ class ReplicationMonitor
         total_objects: total_objects,
         objects_in_sync: replicated_objects,
         sync_percentage: sync_percentage,
+        missing_objects: source_status[:missing_objects],
+        content_mismatches: source_status[:content_mismatches],
+        stale_objects: source_status[:stale_objects],
+        size_mismatches: source_status[:size_mismatches],
         last_sync_time: get_last_sync_time(source_region, target_region),
         issues: issues,
+        detailed_status: source_status[:detailed_status],
         checked_at: Time.now
       }
     rescue StandardError => e
@@ -58,6 +63,10 @@ class ReplicationMonitor
         total_objects: 0,
         objects_in_sync: 0,
         sync_percentage: 0.0,
+        missing_objects: 0,
+        content_mismatches: 0,
+        stale_objects: 0,
+        size_mismatches: 0,
         last_sync_time: nil,
         issues: ["Failed to check replication: #{e.message}"],
         checked_at: Time.now
@@ -102,6 +111,37 @@ class ReplicationMonitor
     if source_status[:objects].any? { |obj| stale_object?(obj, target_region) }
       stale_count = source_status[:objects].count { |obj| stale_object?(obj, target_region) }
       issues << "#{stale_count} objects may be stale in target region"
+    end
+    
+    issues
+  end
+
+  def collect_enhanced_replication_issues(source_status)
+    issues = []
+    
+    # Missing objects
+    if source_status[:missing_objects] > 0
+      issues << "#{source_status[:missing_objects]} objects missing in target region"
+    end
+    
+    # Content mismatches (data corruption/integrity issues)
+    if source_status[:content_mismatches] > 0
+      issues << "#{source_status[:content_mismatches]} objects have content mismatches (checksum differences)"
+    end
+    
+    # Stale objects (replication lag)
+    if source_status[:stale_objects] > 0
+      issues << "#{source_status[:stale_objects]} objects are stale in target region"
+    end
+    
+    # Size mismatches
+    if source_status[:size_mismatches] > 0
+      issues << "#{source_status[:size_mismatches]} objects have size mismatches"
+    end
+    
+    # Overall sync percentage
+    if source_status[:sync_percentage] < 95.0
+      issues << "Overall sync rate: #{source_status[:sync_percentage]}% (below 95% threshold)"
     end
     
     issues
