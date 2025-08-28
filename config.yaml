@@ -1,0 +1,43 @@
+# Storage Replication Monitor Configuration
+storage_type: openstack
+
+regions:
+  region_a:
+    name: "region-east"
+    endpoint: "https://swift.region-east.example.com:8080"
+    storage_type: "openstack"
+    credentials:
+      auth_url: "https://keystone.region-east.example.com:5000/v3"
+      username: "monitoring_user"
+      password: "secure_password"
+      project_name: "storage_project"
+      domain_name: "default"
+  
+  region_b:
+    name: "region-west"
+    endpoint: "https://swift.region-west.example.com:8080"
+    storage_type: "openstack"
+    credentials:
+      auth_url: "https://keystone.region-west.example.com:5000/v3"
+      username: "monitoring_user"
+      password: "secure_password"
+      project_name: "storage_project"
+      domain_name: "default"
+
+monitoring:
+  health_thresholds:
+    healthy: 95.0    # >= 95% sync rate
+    warning: 80.0    # 80-94% sync rate
+    critical: 0.0    # < 80% sync rate
+  
+  staleness_threshold: 3600  # seconds (1 hour)
+  
+  containers:
+    - "primary-data"
+    - "backup-data"
+    - "shared-configs"
+
+notifications:
+  enabled: false
+  email: "admin@example.com"
+  webhook: "https://monitoring.example.com/webhook"
