@@ -3,22 +3,22 @@ storage_type: openstack
 
 regions:
   region_a:
-    name: "region-east"
-    endpoint: "https://swift.region-east.example.com:8080"
+    name: "region-a"
+    endpoint: "https://swift.region-a.example.com:8080"
     storage_type: "openstack"
     credentials:
-      auth_url: "https://keystone.region-east.example.com:5000/v3"
+      auth_url: "https://keystone.region-a.example.com:5000/v3"
       username: "monitoring_user"
       password: "secure_password"
       project_name: "storage_project"
       domain_name: "default"
   
   region_b:
-    name: "region-west"
-    endpoint: "https://swift.region-west.example.com:8080"
+    name: "region-b"
+    endpoint: "https://swift.region-b.example.com:8080"
     storage_type: "openstack"
     credentials:
-      auth_url: "https://keystone.region-west.example.com:5000/v3"
+      auth_url: "https://keystone.region-b.example.com:5000/v3"
       username: "monitoring_user"
       password: "secure_password"
       project_name: "storage_project"
