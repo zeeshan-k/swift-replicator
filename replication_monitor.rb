@@ -5,6 +5,7 @@ require_relative 'lib/replication_monitor'
 require_relative 'lib/region'
 require_relative 'lib/storage_client'
 require_relative 'lib/openstack_storage_client'
+require 'optparse'
 
 # Configuration - supports both generic storage and OpenStack Swift
 STORAGE_TYPE = ENV['STORAGE_TYPE'] || 'generic' # 'generic' or 'openstack'
@@ -61,66 +62,290 @@ else
   }.freeze
 end
 
-def main
-  puts "Storage Replication Monitor - #{Time.now}"
-  puts "=" * 50
-
-  # Initialize regions
-  region_a = Region.new(REGIONS_CONFIG[:region_a])
-  region_b = Region.new(REGIONS_CONFIG[:region_b])
-
-  # Create replication monitor
-  monitor = ReplicationMonitor.new
-
-  # Add bidirectional replication pairs
-  monitor.add_replication_pair(region_a, region_b)
-  monitor.add_replication_pair(region_b, region_a)
-
-  # Run replication checks
-  results = monitor.check_all_replications
-
-  # Display results
-  results.each do |result|
-    puts "\n#{result[:source].name} -> #{result[:target].name}:"
-    puts "  Status: #{result[:status]}"
-    puts "  Last Sync: #{result[:last_sync_time]}"
-    puts "  Objects in Sync: #{result[:objects_in_sync]}/#{result[:total_objects]} (#{result[:sync_percentage]}%)"
+class StorageReplicationTool
+  def initialize
+    @options = {}
+    @region_a = Region.new(REGIONS_CONFIG[:region_a])
+    @region_b = Region.new(REGIONS_CONFIG[:region_b])
+    @monitor = ReplicationMonitor.new
     
-    # Show detailed breakdown if available
-    if result[:missing_objects] || result[:content_mismatches] || result[:stale_objects] || result[:size_mismatches]
-      puts "  Breakdown:"
-      puts "    - Missing: #{result[:missing_objects] || 0}"
-      puts "    - Content mismatches: #{result[:content_mismatches] || 0}" 
-      puts "    - Stale objects: #{result[:stale_objects] || 0}"
-      puts "    - Size mismatches: #{result[:size_mismatches] || 0}"
-    end
-    
-    if result[:status] != 'healthy'
-      puts "  Issues:"
-      result[:issues].each { |issue| puts "    - #{issue}" }
+    # Add bidirectional replication pairs
+    @monitor.add_replication_pair(@region_a, @region_b)
+    @monitor.add_replication_pair(@region_b, @region_a)
+  end
+
+  def parse_options
+    OptionParser.new do |opts|
+      opts.banner = "Usage: #{$PROGRAM_NAME} [options]"
+      opts.separator ""
+      opts.separator "Storage Replication Tool - Monitor and sync storage between regions"
+      opts.separator ""
       
-      # Show detailed status for critical issues (optional)
-      if ENV['VERBOSE'] && result[:detailed_status]
-        problem_objects = result[:detailed_status].select { |detail| detail[:status] != 'replicated' }
-        if problem_objects.any?
-          puts "  Problem Objects:"
-          problem_objects.first(5).each do |obj|
-            puts "    - #{obj[:key]}: #{obj[:status]} (#{obj[:issue]})"
-          end
-          puts "    ... and #{problem_objects.length - 5} more" if problem_objects.length > 5
-        end
+      opts.on("-m", "--monitor", "Monitor replication status") do
+        @options[:action] = :monitor
+      end
+      
+      opts.on("-s", "--sync", "Perform synchronization") do
+        @options[:action] = :sync
+      end
+      
+      opts.on("-c", "--check", "Health check of storage regions") do
+        @options[:action] = :health_check
+      end
+      
+      opts.on("-b", "--bidirectional", "Perform bidirectional sync (A→B and B→A)") do
+        @options[:bidirectional] = true
+      end
+      
+      opts.on("--dry-run", "Show what would be synced without actually syncing") do
+        @options[:dry_run] = true
+      end
+      
+      opts.on("-v", "--verbose", "Enable verbose output") do
+        @options[:verbose] = true
+      end
+      
+      opts.on("-f", "--force", "Force sync even with warnings") do
+        @options[:force] = true
+      end
+      
+      opts.on("-h", "--help", "Show this help message") do
+        puts opts
+        exit
+      end
+      
+      opts.separator ""
+      opts.separator "Examples:"
+      opts.separator "  #{$PROGRAM_NAME} --monitor              # Monitor replication status"
+      opts.separator "  #{$PROGRAM_NAME} --sync --dry-run       # Show what would be synced"
+      opts.separator "  #{$PROGRAM_NAME} --sync --bidirectional # Sync both directions"
+      opts.separator "  #{$PROGRAM_NAME} --check                # Check storage health"
+    end.parse!
+  end
+
+  def run
+    puts "Storage Replication Tool - #{Time.now}"
+    puts "=" * 60
+    
+    if @options[:action].nil?
+      show_interactive_menu
+    else
+      execute_action(@options[:action])
+    end
+  end
+
+  private
+
+  def show_interactive_menu
+    loop do
+      puts "\nSelect an option:"
+      puts "1. Monitor replication status"
+      puts "2. Perform synchronization"
+      puts "3. Health check"
+      puts "4. Bidirectional sync"
+      puts "5. Dry run sync"
+      puts "6. Exit"
+      print "\nEnter choice (1-6): "
+      
+      choice = gets.chomp
+      
+      case choice
+      when '1'
+        execute_action(:monitor)
+      when '2'
+        @options[:dry_run] = false
+        execute_action(:sync)
+      when '3'
+        execute_action(:health_check)
+      when '4'
+        @options[:bidirectional] = true
+        @options[:dry_run] = false
+        execute_action(:sync)
+      when '5'
+        @options[:dry_run] = true
+        execute_action(:sync)
+      when '6'
+        puts "Goodbye!"
+        exit(0)
+      else
+        puts "Invalid choice. Please enter 1-6."
       end
     end
   end
 
-  # Summary
-  healthy_count = results.count { |r| r[:status] == 'healthy' }
-  total_count = results.length
-  
-  puts "\n" + "=" * 50
-  puts "Summary: #{healthy_count}/#{total_count} replication pairs are healthy"
-  
-  exit(healthy_count == total_count ? 0 : 1)
+  def execute_action(action)
+    case action
+    when :monitor
+      monitor_replication
+    when :sync
+      perform_sync
+    when :health_check
+      perform_health_check
+    else
+      puts "Unknown action: #{action}"
+    end
+  end
+
+  def monitor_replication
+    puts "\n📊 MONITORING REPLICATION STATUS"
+    puts "-" * 40
+    
+    results = @monitor.check_all_replications
+    
+    results.each do |result|
+      puts "\n#{result[:source].name} -> #{result[:target].name}:"
+      puts "  Status: #{colorize_status(result[:status])}"
+      puts "  Last Sync: #{result[:last_sync_time] || 'Unknown'}"
+      puts "  Objects in Sync: #{result[:objects_in_sync]}/#{result[:total_objects]} (#{result[:sync_percentage]}%)"
+      
+      # Show detailed breakdown if available
+      if result[:missing_objects] || result[:content_mismatches] || result[:stale_objects] || result[:size_mismatches]
+        puts "  Breakdown:"
+        puts "    - Missing: #{result[:missing_objects] || 0}"
+        puts "    - Content mismatches: #{result[:content_mismatches] || 0}" 
+        puts "    - Stale objects: #{result[:stale_objects] || 0}"
+        puts "    - Size mismatches: #{result[:size_mismatches] || 0}"
+      end
+      
+      if result[:status] != 'healthy'
+        puts "  Issues:"
+        result[:issues].each { |issue| puts "    - #{issue}" }
+        
+        # Show detailed status for critical issues (optional)
+        if @options[:verbose] && result[:detailed_status]
+          problem_objects = result[:detailed_status].select { |detail| detail[:status] != 'replicated' }
+          if problem_objects.any?
+            puts "  Problem Objects:"
+            problem_objects.first(5).each do |obj|
+              puts "    - #{obj[:key]}: #{obj[:status]} (#{obj[:issue]})"
+            end
+            puts "    ... and #{problem_objects.length - 5} more" if problem_objects.length > 5
+          end
+        end
+      end
+    end
+
+    # Summary
+    healthy_count = results.count { |r| r[:status] == 'healthy' }
+    total_count = results.length
+    
+    puts "\n" + "=" * 40
+    puts "Summary: #{healthy_count}/#{total_count} replication pairs are healthy"
+  end
+
+  def perform_sync
+    puts "\n🔄 PERFORMING SYNCHRONIZATION"
+    puts "-" * 40
+    
+    if @options[:dry_run]
+      puts "DRY RUN MODE - No actual changes will be made"
+    end
+    
+    sync_pairs = []
+    
+    if @options[:bidirectional]
+      sync_pairs = [
+        { source: @region_a, target: @region_b, direction: "A → B" },
+        { source: @region_b, target: @region_a, direction: "B → A" }
+      ]
+    else
+      # Default: sync from A to B
+      sync_pairs = [
+        { source: @region_a, target: @region_b, direction: "A → B" }
+      ]
+    end
+    
+    sync_pairs.each do |pair|
+      puts "\n📁 Syncing #{pair[:direction]} (#{pair[:source].name} → #{pair[:target].name})"
+      puts "-" * 30
+      
+      sync_result = @monitor.perform_sync(
+        pair[:source], 
+        pair[:target], 
+        dry_run: @options[:dry_run],
+        force: @options[:force]
+      )
+      
+      display_sync_results(sync_result)
+    end
+  end
+
+  def perform_health_check
+    puts "\n🏥 HEALTH CHECK"
+    puts "-" * 40
+    
+    puts "\nChecking Region A (#{@region_a.name}):"
+    health_a = @region_a.client.health_check
+    display_health_status(health_a)
+    
+    puts "\nChecking Region B (#{@region_b.name}):"
+    health_b = @region_b.client.health_check
+    display_health_status(health_b)
+    
+    overall_healthy = health_a[:status] == 'healthy' && health_b[:status] == 'healthy'
+    puts "\n" + "=" * 40
+    puts "Overall Health: #{overall_healthy ? '✅ HEALTHY' : '❌ UNHEALTHY'}"
+  end
+
+  def display_sync_results(result)
+    if result[:success]
+      puts "✅ Sync completed successfully"
+      puts "  📊 Statistics:"
+      puts "    - Objects synced: #{result[:synced_count]}"
+      puts "    - Objects skipped: #{result[:skipped_count]}"
+      puts "    - Errors: #{result[:error_count]}"
+      puts "    - Total time: #{result[:duration]&.round(2)}s"
+      
+      if result[:synced_objects].any?
+        puts "  📁 Synced objects:"
+        result[:synced_objects].first(5).each do |obj|
+          puts "    - #{obj[:key]} (#{obj[:size]} bytes)"
+        end
+        if result[:synced_objects].length > 5
+          puts "    ... and #{result[:synced_objects].length - 5} more"
+        end
+      end
+      
+      if result[:errors].any?
+        puts "  ⚠️  Errors:"
+        result[:errors].each do |error|
+          puts "    - #{error}"
+        end
+      end
+    else
+      puts "❌ Sync failed"
+      puts "  Error: #{result[:error]}"
+    end
+  end
+
+  def display_health_status(health)
+    status_icon = health[:status] == 'healthy' ? '✅' : '❌'
+    puts "  Status: #{status_icon} #{health[:status].upcase}"
+    puts "  Response Time: #{health[:response_time]}ms" if health[:response_time]
+    puts "  Last Check: #{health[:last_check]}"
+    puts "  Error: #{health[:error]}" if health[:error]
+  end
+
+  def colorize_status(status)
+    case status
+    when 'healthy'
+      "✅ #{status}"
+    when 'warning'
+      "⚠️  #{status}"
+    when 'critical'
+      "🔥 #{status}"
+    when 'error'
+      "❌ #{status}"
+    else
+      status
+    end
+  end
+end
+
+def main
+  tool = StorageReplicationTool.new
+  tool.parse_options
+  tool.run
 rescue StandardError => e
   puts "Error: #{e.message}"
   puts e.backtrace if ENV['DEBUG']

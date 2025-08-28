@@ -31,25 +31,111 @@ class StorageClient
     !get_object_metadata(object_key, bucket).nil?
   end
 
+  # Get object content as string (for sync operations)
+  def get_object_content(object_key, bucket = nil)
+    # Mock implementation - returns simulated content
+    # In real implementation, this would fetch the actual object data
+    
+    metadata = get_object_metadata(object_key, bucket)
+    return nil unless metadata
+    
+    # Generate mock content based on object size
+    mock_content_for_object(object_key, metadata[:size])
+  end
+
+  # Upload/write an object (for sync operations)
+  def put_object(object_key, content, bucket = nil, content_type = 'application/octet-stream')
+    # Mock implementation - simulates uploading content
+    # In real implementation, this would upload to actual storage service
+    
+    bucket ||= 'default-bucket'
+    
+    puts "    📤 Mock upload: #{object_key} (#{content.bytesize} bytes) to #{bucket}"
+    
+    # Simulate upload delay
+    sleep(0.1) unless ENV['FAST_MOCK']
+    
+    # Mock success response
+    {
+      success: true,
+      etag: "\"#{generate_mock_etag}\"",
+      bucket: bucket,
+      object: object_key,
+      size: content.bytesize,
+      uploaded_at: Time.now
+    }
+  rescue StandardError => e
+    {
+      success: false,
+      error: e.message
+    }
+  end
+
+  # Delete an object (for cleanup operations)
+  def delete_object(object_key, bucket = nil)
+    # Mock implementation
+    bucket ||= 'default-bucket'
+    
+    puts "    🗑️  Mock delete: #{object_key} from #{bucket}"
+    
+    {
+      success: true,
+      deleted: object_key,
+      bucket: bucket
+    }
+  rescue StandardError => e
+    {
+      success: false,
+      error: e.message
+    }
+  end
+
   # Get storage service health status
   def health_check
     begin
       # Mock health check - replace with actual endpoint health check
+      start_time = Time.now
+      
+      # Simulate health check by trying to list objects
+      list_objects('health-check-bucket')
+      
+      response_time = ((Time.now - start_time) * 1000).round(2)
+      
       {
         status: 'healthy',
-        response_time: rand(10..50), # milliseconds
-        last_check: Time.now
+        response_time: response_time,
+        last_check: Time.now,
+        endpoint: @endpoint
       }
     rescue StandardError => e
       {
         status: 'unhealthy',
         error: e.message,
-        last_check: Time.now
+        last_check: Time.now,
+        response_time: nil
       }
     end
   end
 
   private
+
+  def mock_content_for_object(object_key, size)
+    # Generate deterministic content based on object key
+    # This ensures consistent content for the same object across calls
+    
+    base_content = "Mock content for #{object_key}\n"
+    base_content += "Generated at: #{Time.now}\n"
+    base_content += "Size target: #{size} bytes\n"
+    base_content += "-" * 40 + "\n"
+    
+    # Pad content to reach approximate target size
+    while base_content.bytesize < size
+      base_content += "Data block #{base_content.bytesize / 100}: " + ("x" * 50) + "\n"
+    end
+    
+    # Truncate to exact size if needed
+    base_content[0, size]
+  end
 
   # Mock data generator - replace with actual API calls
   def mock_objects_for_region(region_name, bucket = nil)
@@ -112,41 +198,4 @@ class StorageClient
     chars = ('a'..'f').to_a + ('0'..'9').to_a
     32.times.map { chars.sample }.join
   end
-
-  # Real implementation would use actual HTTP calls like:
-  # def make_request(method, path, headers = {})
-  #   uri = URI.join(@endpoint, path)
-  #   
-  #   http = Net::HTTP.new(uri.host, uri.port)
-  #   http.use_ssl = uri.scheme == 'https'
-  #   
-  #   request_class = case method
-  #   when :get then Net::HTTP::Get
-  #   when :post then Net::HTTP::Post
-  #   when :put then Net::HTTP::Put
-  #   when :delete then Net::HTTP::Delete
-  #   end
-  #   
-  #   request = request_class.new(uri.path)
-  #   headers.each { |key, value| request[key] = value }
-  #   
-  #   # Add authentication headers based on @credentials
-  #   add_auth_headers(request)
-  #   
-  #   response = http.request(request)
-  #   
-  #   case response.code
-  #   when '200', '201', '204'
-  #     JSON.parse(response.body) rescue response.body
-  #   else
-  #     raise "HTTP #{response.code}: #{response.body}"
-  #   end
-  # end
-  # 
-  # def add_auth_headers(request)
-  #   # Add authentication based on your storage service
-  #   # For AWS S3, this would be AWS Signature Version 4
-  #   # For Azure, this would be SharedKey or SAS token
-  #   # For GCP, this would be OAuth 2.0 Bearer token
-  # end
 end

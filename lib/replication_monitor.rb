@@ -74,6 +74,104 @@ class ReplicationMonitor
     end
   end
 
+  # Perform actual synchronization between regions
+  def perform_sync(source_region, target_region, options = {})
+    dry_run = options[:dry_run] || false
+    force = options[:force] || false
+    
+    puts "#{dry_run ? 'DRY RUN: ' : ''}Syncing #{source_region.name} -> #{target_region.name}"
+    
+    start_time = Time.now
+    synced_objects = []
+    errors = []
+    skipped_count = 0
+    
+    begin
+      # Get replication status to identify objects that need syncing
+      replication_status = source_region.get_replication_status(target_region)
+      objects_needing_sync = get_objects_needing_sync(replication_status[:detailed_status])
+      
+      if objects_needing_sync.empty?
+        return {
+          success: true,
+          synced_count: 0,
+          skipped_count: 0,
+          error_count: 0,
+          synced_objects: [],
+          errors: [],
+          duration: Time.now - start_time,
+          message: "All objects are already in sync"
+        }
+      end
+      
+      puts "Found #{objects_needing_sync.length} objects that need syncing"
+      
+      # Check if sync should proceed
+      if requires_force_sync?(objects_needing_sync) && !force
+        return {
+          success: false,
+          error: "Sync requires --force flag due to critical issues (content mismatches or large number of objects)",
+          synced_count: 0,
+          skipped_count: 0,
+          error_count: 0,
+          synced_objects: [],
+          errors: []
+        }
+      end
+      
+      objects_needing_sync.each_with_index do |obj_detail, index|
+        progress_percentage = ((index + 1).to_f / objects_needing_sync.length * 100).round(1)
+        puts "  Progress: #{progress_percentage}% (#{index + 1}/#{objects_needing_sync.length})"
+        
+        begin
+          sync_result = sync_single_object(
+            source_region, 
+            target_region, 
+            obj_detail, 
+            dry_run: dry_run
+          )
+          
+          if sync_result[:success]
+            synced_objects << sync_result[:object_info]
+            puts "    ✅ #{sync_result[:action]}: #{obj_detail[:key]}"
+          else
+            skipped_count += 1
+            puts "    ⏭️  Skipped: #{obj_detail[:key]} (#{sync_result[:reason]})"
+          end
+          
+        rescue StandardError => e
+          error_msg = "Failed to sync #{obj_detail[:key]}: #{e.message}"
+          errors << error_msg
+          puts "    ❌ #{error_msg}"
+        end
+      end
+      
+      duration = Time.now - start_time
+      
+      {
+        success: true,
+        synced_count: synced_objects.length,
+        skipped_count: skipped_count,
+        error_count: errors.length,
+        synced_objects: synced_objects,
+        errors: errors,
+        duration: duration
+      }
+      
+    rescue StandardError => e
+      {
+        success: false,
+        error: "Sync operation failed: #{e.message}",
+        synced_count: synced_objects.length,
+        skipped_count: skipped_count,
+        error_count: errors.length + 1,
+        synced_objects: synced_objects,
+        errors: errors + [e.message],
+        duration: Time.now - start_time
+      }
+    end
+  end
+
   # Get summary of all replication statuses
   def get_summary
     results = check_all_replications
@@ -91,29 +189,193 @@ class ReplicationMonitor
 
   private
 
+  def get_objects_needing_sync(detailed_status)
+    # Return objects that are not in 'replicated' status
+    detailed_status.select { |detail| detail[:status] != 'replicated' }
+  end
+
+  def requires_force_sync?(objects_needing_sync)
+    # Require --force if there are content mismatches or too many objects
+    content_mismatches = objects_needing_sync.count { |obj| obj[:status] == 'content_mismatch' }
+    large_sync = objects_needing_sync.length > 100
+    
+    content_mismatches > 0 || large_sync
+  end
+
+  def sync_single_object(source_region, target_region, obj_detail, options = {})
+    dry_run = options[:dry_run] || false
+    
+    case obj_detail[:status]
+    when 'missing'
+      sync_missing_object(source_region, target_region, obj_detail, dry_run)
+    when 'stale'
+      sync_stale_object(source_region, target_region, obj_detail, dry_run)
+    when 'content_mismatch'
+      sync_content_mismatch(source_region, target_region, obj_detail, dry_run)
+    when 'size_mismatch'
+      sync_size_mismatch(source_region, target_region, obj_detail, dry_run)
+    else
+      {
+        success: false,
+        reason: "Unknown sync status: #{obj_detail[:status]}"
+      }
+    end
+  end
+
+  def sync_missing_object(source_region, target_region, obj_detail, dry_run)
+    if dry_run
+      return {
+        success: true,
+        action: "Would copy missing object",
+        object_info: { key: obj_detail[:key], container: obj_detail[:container] }
+      }
+    end
+    
+    # Get object content from source
+    content = source_region.client.get_object_content(obj_detail[:key], obj_detail[:container])
+    
+    # Upload to target
+    upload_result = target_region.client.put_object(
+      obj_detail[:key], 
+      content, 
+      obj_detail[:container]
+    )
+    
+    if upload_result[:success]
+      {
+        success: true,
+        action: "Copied missing object",
+        object_info: {
+          key: obj_detail[:key],
+          container: obj_detail[:container],
+          size: upload_result[:size]
+        }
+      }
+    else
+      {
+        success: false,
+        reason: "Upload failed: #{upload_result[:error]}"
+      }
+    end
+  end
+
+  def sync_stale_object(source_region, target_region, obj_detail, dry_run)
+    if dry_run
+      lag_info = obj_detail[:replication_lag] ? " (#{obj_detail[:replication_lag]}s behind)" : ""
+      return {
+        success: true,
+        action: "Would update stale object#{lag_info}",
+        object_info: { key: obj_detail[:key], container: obj_detail[:container] }
+      }
+    end
+    
+    # Update stale object with latest version from source
+    content = source_region.client.get_object_content(obj_detail[:key], obj_detail[:container])
+    
+    upload_result = target_region.client.put_object(
+      obj_detail[:key], 
+      content, 
+      obj_detail[:container]
+    )
+    
+    if upload_result[:success]
+      {
+        success: true,
+        action: "Updated stale object",
+        object_info: {
+          key: obj_detail[:key],
+          container: obj_detail[:container],
+          size: upload_result[:size]
+        }
+      }
+    else
+      {
+        success: false,
+        reason: "Update failed: #{upload_result[:error]}"
+      }
+    end
+  end
+
+  def sync_content_mismatch(source_region, target_region, obj_detail, dry_run)
+    if dry_run
+      etag_info = " (source: #{obj_detail[:source_etag]}, target: #{obj_detail[:target_etag]})"
+      return {
+        success: true,
+        action: "Would fix content mismatch#{etag_info}",
+        object_info: { key: obj_detail[:key], container: obj_detail[:container] }
+      }
+    end
+    
+    # Replace target object with source version
+    content = source_region.client.get_object_content(obj_detail[:key], obj_detail[:container])
+    
+    upload_result = target_region.client.put_object(
+      obj_detail[:key], 
+      content, 
+      obj_detail[:container]
+    )
+    
+    if upload_result[:success]
+      {
+        success: true,
+        action: "Fixed content mismatch",
+        object_info: {
+          key: obj_detail[:key],
+          container: obj_detail[:container],
+          size: upload_result[:size]
+        }
+      }
+    else
+      {
+        success: false,
+        reason: "Content fix failed: #{upload_result[:error]}"
+      }
+    end
+  end
+
+  def sync_size_mismatch(source_region, target_region, obj_detail, dry_run)
+    if dry_run
+      size_info = " (source: #{obj_detail[:source_size]}, target: #{obj_detail[:target_size]})"
+      return {
+        success: true,
+        action: "Would fix size mismatch#{size_info}",
+        object_info: { key: obj_detail[:key], container: obj_detail[:container] }
+      }
+    end
+    
+    # Replace target object with source version
+    content = source_region.client.get_object_content(obj_detail[:key], obj_detail[:container])
+    
+    upload_result = target_region.client.put_object(
+      obj_detail[:key], 
+      content, 
+      obj_detail[:container]
+    )
+    
+    if upload_result[:success]
+      {
+        success: true,
+        action: "Fixed size mismatch",
+        object_info: {
+          key: obj_detail[:key],
+          container: obj_detail[:container],
+          size: upload_result[:size]
+        }
+      }
+    else
+      {
+        success: false,
+        reason: "Size fix failed: #{upload_result[:error]}"
+      }
+    end
+  end
+
   def determine_replication_status(sync_percentage, source_region, target_region)
     return 'error' if sync_percentage.nil?
     return 'healthy' if sync_percentage >= 95.0
     return 'warning' if sync_percentage >= 80.0
     
     'critical'
-  end
-
-  def collect_replication_issues(source_status, target_region, sync_percentage)
-    issues = []
-    
-    if sync_percentage < 95.0
-      missing_objects = source_status[:total_objects] - source_status[:replicated_objects]
-      issues << "#{missing_objects} objects not replicated (#{(100 - sync_percentage).round(2)}% missing)"
-    end
-    
-    # Check for stale replication (objects not updated recently)
-    if source_status[:objects].any? { |obj| stale_object?(obj, target_region) }
-      stale_count = source_status[:objects].count { |obj| stale_object?(obj, target_region) }
-      issues << "#{stale_count} objects may be stale in target region"
-    end
-    
-    issues
   end
 
   def collect_enhanced_replication_issues(source_status)
@@ -145,17 +407,6 @@ class ReplicationMonitor
     end
     
     issues
-  end
-
-  def stale_object?(source_obj, target_region)
-    return false unless target_region.object_exists?(source_obj[:key], source_obj[:bucket])
-    
-    target_obj = target_region.get_object_metadata(source_obj[:key], source_obj[:bucket])
-    return false unless target_obj
-    
-    # Consider object stale if target is more than 1 hour behind source
-    time_diff = source_obj[:last_modified] - target_obj[:last_modified]
-    time_diff > 3600 # 1 hour in seconds
   end
 
   def get_last_sync_time(source_region, target_region)
