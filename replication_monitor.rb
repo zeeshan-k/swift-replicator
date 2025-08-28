@@ -93,8 +93,14 @@ class StorageReplicationTool
         @options[:action] = :health_check
       end
       
-      opts.on("-b", "--bidirectional", "Perform bidirectional sync (A→B and B→A)") do
+      opts.on("-b", "--bidirectional", "Perform bidirectional sync (A↔B)") do
         @options[:bidirectional] = true
+      end
+      
+      opts.on("--conflict-strategy STRATEGY", 
+              ["newest_wins", "region_a_wins", "region_b_wins", "largest_wins", "manual"],
+              "Conflict resolution strategy (newest_wins, region_a_wins, region_b_wins, largest_wins, manual)") do |strategy|
+        @options[:conflict_strategy] = strategy
       end
       
       opts.on("--dry-run", "Show what would be synced without actually syncing") do
@@ -115,11 +121,19 @@ class StorageReplicationTool
       end
       
       opts.separator ""
+      opts.separator "Conflict Resolution Strategies:"
+      opts.separator "  newest_wins    - Use the most recently modified version (default)"
+      opts.separator "  region_a_wins  - Always use Region A as source of truth"
+      opts.separator "  region_b_wins  - Always use Region B as source of truth"  
+      opts.separator "  largest_wins   - Use the version with larger file size"
+      opts.separator "  manual         - Prompt user to resolve each conflict"
+      opts.separator ""
       opts.separator "Examples:"
-      opts.separator "  #{$PROGRAM_NAME} --monitor              # Monitor replication status"
-      opts.separator "  #{$PROGRAM_NAME} --sync --dry-run       # Show what would be synced"
-      opts.separator "  #{$PROGRAM_NAME} --sync --bidirectional # Sync both directions"
-      opts.separator "  #{$PROGRAM_NAME} --check                # Check storage health"
+      opts.separator "  #{$PROGRAM_NAME} --monitor                                    # Monitor replication status"
+      opts.separator "  #{$PROGRAM_NAME} --sync --dry-run                           # Show what would be synced"
+      opts.separator "  #{$PROGRAM_NAME} --sync --bidirectional                     # Smart bidirectional sync"
+      opts.separator "  #{$PROGRAM_NAME} --sync --bidirectional --conflict-strategy=manual  # Manual conflict resolution"
+      opts.separator "  #{$PROGRAM_NAME} --check                                    # Check storage health"
     end.parse!
   end
 
@@ -142,10 +156,11 @@ class StorageReplicationTool
       puts "1. Monitor replication status"
       puts "2. Perform synchronization"
       puts "3. Health check"
-      puts "4. Bidirectional sync"
+      puts "4. Smart bidirectional sync"
       puts "5. Dry run sync"
-      puts "6. Exit"
-      print "\nEnter choice (1-6): "
+      puts "6. Configure conflict resolution"
+      puts "7. Exit"
+      print "\nEnter choice (1-7): "
       
       choice = gets.chomp
       
@@ -160,17 +175,45 @@ class StorageReplicationTool
       when '4'
         @options[:bidirectional] = true
         @options[:dry_run] = false
+        @options[:conflict_strategy] ||= 'newest_wins'
         execute_action(:sync)
       when '5'
         @options[:dry_run] = true
         execute_action(:sync)
       when '6'
+        configure_conflict_resolution
+      when '7'
         puts "Goodbye!"
         exit(0)
       else
-        puts "Invalid choice. Please enter 1-6."
+        puts "Invalid choice. Please enter 1-7."
       end
     end
+  end
+
+  def configure_conflict_resolution
+    puts "\n⚙️  CONFLICT RESOLUTION CONFIGURATION"
+    puts "-" * 40
+    puts "Choose default conflict resolution strategy:"
+    puts "1. Newest Wins (use most recently modified version)"
+    puts "2. Region A Wins (always prefer Region A)"
+    puts "3. Region B Wins (always prefer Region B)"
+    puts "4. Largest Wins (use version with larger file size)"
+    puts "5. Manual (prompt for each conflict)"
+    print "\nEnter choice (1-5): "
+    
+    choice = gets.chomp
+    
+    @options[:conflict_strategy] = case choice
+    when '1' then 'newest_wins'
+    when '2' then 'region_a_wins'
+    when '3' then 'region_b_wins'
+    when '4' then 'largest_wins'
+    when '5' then 'manual'
+    else 'newest_wins' # Default
+    end
+    
+    puts "✅ Conflict resolution set to: #{@options[:conflict_strategy]}"
   end
 
   def execute_action(action)
@@ -199,12 +242,13 @@ class StorageReplicationTool
       puts "  Objects in Sync: #{result[:objects_in_sync]}/#{result[:total_objects]} (#{result[:sync_percentage]}%)"
       
       # Show detailed breakdown if available
-      if result[:missing_objects] || result[:content_mismatches] || result[:stale_objects] || result[:size_mismatches]
+      if result[:missing_objects] || result[:content_mismatches] || result[:stale_objects] || result[:size_mismatches] || result[:bidirectional_conflicts]
         puts "  Breakdown:"
         puts "    - Missing: #{result[:missing_objects] || 0}"
         puts "    - Content mismatches: #{result[:content_mismatches] || 0}" 
         puts "    - Stale objects: #{result[:stale_objects] || 0}"
         puts "    - Size mismatches: #{result[:size_mismatches] || 0}"
+        puts "    - Bidirectional conflicts: #{result[:bidirectional_conflicts] || 0}" if result[:bidirectional_conflicts]
       end
       
       if result[:status] != 'healthy'
@@ -241,32 +285,39 @@ class StorageReplicationTool
       puts "DRY RUN MODE - No actual changes will be made"
     end
     
-    sync_pairs = []
-    
     if @options[:bidirectional]
-      sync_pairs = [
-        { source: @region_a, target: @region_b, direction: "A → B" },
-        { source: @region_b, target: @region_a, direction: "B → A" }
-      ]
-    else
-      # Default: sync from A to B
-      sync_pairs = [
-        { source: @region_a, target: @region_b, direction: "A → B" }
-      ]
-    end
-    
-    sync_pairs.each do |pair|
-      puts "\n📁 Syncing #{pair[:direction]} (#{pair[:source].name} → #{pair[:target].name})"
-      puts "-" * 30
+      # Enhanced bidirectional sync with conflict resolution
+      conflict_strategy = @options[:conflict_strategy] || 'newest_wins'
+      puts "Using conflict resolution strategy: #{conflict_strategy.upcase}"
       
-      sync_result = @monitor.perform_sync(
-        pair[:source], 
-        pair[:target], 
+      sync_result = @monitor.perform_bidirectional_sync(
+        @region_a, 
+        @region_b,
         dry_run: @options[:dry_run],
+        conflict_strategy: conflict_strategy,
         force: @options[:force]
       )
       
-      display_sync_results(sync_result)
+      display_bidirectional_sync_results(sync_result)
+    else
+      # Unidirectional sync (A → B)
+      sync_pairs = [
+        { source: @region_a, target: @region_b, direction: "A → B" }
+      ]
+      
+      sync_pairs.each do |pair|
+        puts "\n📁 Syncing #{pair[:direction]} (#{pair[:source].name} → #{pair[:target].name})"
+        puts "-" * 30
+        
+        sync_result = @monitor.perform_sync(
+          pair[:source], 
+          pair[:target], 
+          dry_run: @options[:dry_run],
+          force: @options[:force]
+        )
+        
+        display_sync_results(sync_result)
+      end
     end
   end
 
@@ -285,6 +336,32 @@ class StorageReplicationTool
     overall_healthy = health_a[:status] == 'healthy' && health_b[:status] == 'healthy'
     puts "\n" + "=" * 40
     puts "Overall Health: #{overall_healthy ? '✅ HEALTHY' : '❌ UNHEALTHY'}"
+  end
+
+  def display_bidirectional_sync_results(result)
+    if result[:success]
+      puts "\n✅ BIDIRECTIONAL SYNC COMPLETED SUCCESSFULLY"
+      puts "  📊 Overall Statistics:"
+      puts "    - Total objects synced: #{result[:total_synced_count]}"
+      puts "    - Conflicts detected: #{result[:conflicts_detected]}"
+      puts "    - Conflicts resolved: #{result[:conflicts_resolved]}"
+      puts "    - A→B synced: #{result[:a_to_b_synced]}"
+      puts "    - B→A synced: #{result[:b_to_a_synced]}"
+      puts "    - Total errors: #{result[:total_error_count]}"
+      puts "    - Total time: #{result[:duration]&.round(2)}s"
+      
+      # Show conflict details if any
+      if result[:detailed_results][:conflicts_resolved].any?
+        puts "\n  🔥 Resolved Conflicts:"
+        result[:detailed_results][:conflicts_resolved].each do |conflict|
+          puts "    - #{conflict[:key]}: #{conflict[:action]} (#{conflict[:resolution_strategy]})"
+        end
+      end
+      
+    else
+      puts "\n❌ BIDIRECTIONAL SYNC FAILED"
+      puts "  Error: #{result[:error]}"
+    end
   end
 
   def display_sync_results(result)

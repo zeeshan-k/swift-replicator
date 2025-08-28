@@ -37,7 +37,7 @@ class Region
     @client.object_exists?(object_key, container)
   end
 
-  # Get comprehensive replication status including content verification
+  # Get comprehensive replication status including content verification and bidirectional conflicts
   def get_replication_status(target_region)
     objects = list_objects
     
@@ -52,6 +52,9 @@ class Region
     size_mismatches = replication_details.select { |detail| detail[:status] == 'size_mismatch' }
     replicated_objects = replication_details.select { |detail| detail[:status] == 'replicated' }
     
+    # Detect bidirectional conflicts (objects that exist in both regions but differ)
+    bidirectional_conflicts = detect_bidirectional_conflicts(target_region)
+    
     {
       total_objects: objects.length,
       replicated_objects: replicated_objects.length,
@@ -59,10 +62,12 @@ class Region
       content_mismatches: content_mismatches.length,
       stale_objects: stale_objects.length,
       size_mismatches: size_mismatches.length,
+      bidirectional_conflicts: bidirectional_conflicts.length,
       sync_percentage: calculate_sync_percentage(objects.length, replicated_objects.length),
       last_replication_check: Time.now,
       replication_health: determine_replication_health(replication_details),
-      detailed_status: replication_details
+      detailed_status: replication_details,
+      conflict_details: bidirectional_conflicts
     }
   end
 
@@ -104,13 +109,88 @@ class Region
     raise ArgumentError, "Missing secret_key" if @credentials[:secret_key].nil?
   end
 
-  def count_replicated_objects(objects, target_region)
-    objects.count do |obj|
-      # Use appropriate identifier based on storage type
-      key = obj[:key]
-      container = @storage_type == 'openstack' ? obj[:container] : obj[:bucket]
-      target_region.object_exists?(key, container)
+  def detect_bidirectional_conflicts(target_region)
+    conflicts = []
+    
+    # Get objects from both regions
+    source_objects = list_objects
+    target_objects = target_region.list_objects
+    
+    # Find objects that exist in both regions
+    source_objects.each do |source_obj|
+      target_obj = target_objects.find { |t_obj| t_obj[:key] == source_obj[:key] }
+      next unless target_obj # Skip if object doesn't exist in target
+      
+      # Analyze for conflicts
+      conflict = analyze_bidirectional_conflict(source_obj, target_obj)
+      conflicts << conflict if conflict
     end
+    
+    conflicts
+  end
+
+  def analyze_bidirectional_conflict(source_obj, target_obj)
+    key = source_obj[:key]
+    
+    # Parse timestamps
+    source_time = parse_time(source_obj[:last_modified])
+    target_time = parse_time(target_obj[:last_modified])
+    time_diff = (source_time - target_time).abs
+    
+    # Compare content hashes
+    source_etag = normalize_etag(source_obj[:etag])
+    target_etag = normalize_etag(target_obj[:etag])
+    content_differs = source_etag != target_etag
+    
+    # Compare sizes
+    source_size = source_obj[:size]
+    target_size = target_obj[:size]
+    size_differs = source_size != target_size
+    
+    # Only return conflict if content actually differs
+    return nil unless content_differs || size_differs
+    
+    # Determine conflict type
+    if time_diff < 60 && content_differs
+      # Same timestamp (within 1 minute) but different content - true conflict!
+      {
+        key: key,
+        conflict_type: 'simultaneous_modification',
+        severity: 'high',
+        source_etag: source_etag,
+        target_etag: target_etag,
+        source_size: source_size,
+        target_size: target_size,
+        source_time: source_time,
+        target_time: target_time,
+        time_diff: time_diff,
+        description: "File modified simultaneously in both regions"
+      }
+    elsif content_differs
+      # Different content with time difference
+      newer_region = source_time > target_time ? 'source' : 'target'
+      {
+        key: key,
+        conflict_type: 'content_divergence',
+        severity: 'medium',
+        source_etag: source_etag,
+        target_etag: target_etag,
+        source_size: source_size,
+        target_size: target_size,
+        source_time: source_time,
+        target_time: target_time,
+        newer_region: newer_region,
+        time_diff: time_diff,
+        description: "Different content versions (#{newer_region} is newer)"
+      }
+    else
+      nil # No actual conflict
+    end
+  end
+
+  def normalize_etag(etag)
+    # Remove quotes and normalize etag format
+    etag.to_s.gsub(/["']/, '').downcase
   end
 
   def analyze_object_replication(source_obj, target_region)
@@ -131,45 +211,54 @@ class Region
     target_metadata = target_region.get_object_metadata(key, container)
     return handle_metadata_error(key, container) if target_metadata.nil?
     
-    # Compare content integrity (ETag/checksum)
-    if source_obj[:etag] != target_metadata[:etag]
+    # Compare content integrity (ETag/checksum) - most important check
+    source_etag = normalize_etag(source_obj[:etag])
+    target_etag = normalize_etag(target_metadata[:etag])
+    
+    if source_etag != target_etag
       return {
         key: key,
         container: container,
         status: 'content_mismatch',
-        issue: 'Content checksums differ',
-        source_etag: source_obj[:etag],
-        target_etag: target_metadata[:etag]
+        issue: 'Content checksums differ - possible corruption or different versions',
+        source_etag: source_etag,
+        target_etag: target_etag,
+        priority: 'high' # Content mismatches are high priority
       }
     end
     
-    # Compare file sizes
+    # Compare file sizes (secondary check)
     if source_obj[:size] != target_metadata[:size]
       return {
         key: key,
         container: container,
         status: 'size_mismatch',
-        issue: 'File sizes differ',
+        issue: 'File sizes differ despite matching checksums',
         source_size: source_obj[:size],
-        target_size: target_metadata[:size]
+        target_size: target_metadata[:size],
+        priority: 'medium'
       }
     end
     
-    # Compare modification times (detect stale objects)
+    # Compare modification times (tertiary check for staleness)
     source_time = parse_time(source_obj[:last_modified])
     target_time = parse_time(target_metadata[:last_modified])
     
     if source_time > target_time
       time_diff = source_time - target_time
-      return {
-        key: key,
-        container: container,
-        status: 'stale',
-        issue: 'Target object is outdated',
-        replication_lag: time_diff.round(2),
-        source_modified: source_time,
-        target_modified: target_time
-      }
+      # Only consider stale if time difference is significant (> 5 minutes)
+      if time_diff > 300
+        return {
+          key: key,
+          container: container,
+          status: 'stale',
+          issue: 'Target object timestamp is significantly older',
+          replication_lag: time_diff.round(2),
+          source_modified: source_time,
+          target_modified: target_time,
+          priority: 'low'
+        }
+      end
     end
     
     # Object is properly replicated
@@ -177,7 +266,10 @@ class Region
       key: key,
       container: container,
       status: 'replicated',
-      last_verified: Time.now
+      last_verified: Time.now,
+      checksum_match: true,
+      size_match: true,
+      timestamp_current: true
     }
   rescue StandardError => e
     handle_comparison_error(key, container, e)
@@ -223,6 +315,11 @@ class Region
     return 'healthy' if total.zero?
     
     replicated = replication_details.count { |detail| detail[:status] == 'replicated' }
+    content_mismatches = replication_details.count { |detail| detail[:status] == 'content_mismatch' }
+    
+    # Content mismatches are critical
+    return 'critical' if content_mismatches > 0
+    
     sync_percentage = calculate_sync_percentage(total, replicated)
     
     case sync_percentage
