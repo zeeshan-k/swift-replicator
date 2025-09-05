@@ -11,45 +11,18 @@ require 'json'
 def demo_stdin_config_passing
   puts "=== Demo: Passing YAML config via stdin (Method 3) ==="
   
-  # Create configuration in memory (no file written)
-  config = {
-    'storage_type' => 'openstack',
-    'regions' => {
-      'region_a' => {
-        'name' => 'swift-east',
-        'endpoint' => 'https://swift.east.example.com:8080',
-        'storage_type' => 'openstack',
-        'credentials' => {
-          'auth_url' => 'https://keystone.east.example.com:5000/v3',
-          'username' => 'monitor_user',
-          'password' => 'secure_password',
-          'project_name' => 'monitoring_project',
-          'domain_name' => 'default'
-        }
-      },
-      'region_b' => {
-        'name' => 'swift-west',
-        'endpoint' => 'https://swift.west.example.com:8080',
-        'storage_type' => 'openstack',
-        'credentials' => {
-          'auth_url' => 'https://keystone.west.example.com:5000/v3',
-          'username' => 'monitor_user',
-          'password' => 'secure_password',
-          'project_name' => 'monitoring_project',
-          'domain_name' => 'default'
-        }
-      }
-    },
-    'monitoring' => {
-      'health_thresholds' => {
-        'healthy' => 95.0,
-        'warning' => 80.0,
-        'critical' => 0.0
-      },
-      'staleness_threshold' => 3600,
-      'containers' => ['data-container', 'backup-container']
-    }
-  }
+  # Read configuration from config.yaml file
+  begin
+    config = YAML.load_file('config.yaml')
+    puts "✅ Loaded configuration from config.yaml"
+  rescue Errno::ENOENT
+    puts "❌ Error: config.yaml file not found"
+    puts "Please ensure config.yaml exists in the current directory"
+    return
+  rescue => e
+    puts "❌ Error reading config.yaml: #{e.message}"
+    return
+  end
   
   # Convert to YAML string (still in memory)
   yaml_content = config.to_yaml
@@ -60,27 +33,27 @@ def demo_stdin_config_passing
   puts "\n--- Passing config via stdin to monitoring tool ---"
   
   # Simulate calling our replication monitor with stdin config
-  demo_script = <<~RUBY
+  demo_script = <<~'RUBY'
     require 'yaml'
-    
+
     # Read YAML from stdin (no filesystem access)
     config_yaml = STDIN.read
     config = YAML.safe_load(config_yaml)
-    
+
     puts "Received config via stdin:"
     puts "Storage type: #{config['storage_type']}"
     puts "Regions: #{config['regions'].keys.join(', ')}"
     puts "Containers to monitor: #{config.dig('monitoring', 'containers')&.join(', ')}"
-    
+
     # Process the configuration
     config['regions'].each do |region_name, region_config|
-      puts "\\nRegion: #{region_config['name']}"
+      puts "\nRegion: #{region_config['name']}"
       puts "  Endpoint: #{region_config['endpoint']}"
       puts "  Auth URL: #{region_config.dig('credentials', 'auth_url')}"
       puts "  Project: #{region_config.dig('credentials', 'project_name')}"
     end
-    
-    puts "\\nConfiguration processed successfully - no temp files created!"
+
+    puts "\nConfiguration processed successfully - no temp files created!"
     exit 0
   RUBY
   
